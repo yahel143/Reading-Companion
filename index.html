@@ -138,7 +138,13 @@
   .he-block:first-child, .word-row + .he-block.solo { border-top: 0; padding-top: 0; }
   .he { font-family: var(--hebrew); font-size: 34px; font-weight: 600; line-height: 1.25; text-align: right; }
   .he-alts { font-family: var(--hebrew); font-size: 19px; color: var(--muted); text-align: right; margin-top: 4px; }
-  .he-explain { font-family: var(--hebrew); font-size: 21px; line-height: 1.5; text-align: right; margin-top: 8px; }
+  .ipa { color: var(--muted); font-size: 16px; margin-top: 4px; font-family: "Segoe UI", "Noto Sans", system-ui, sans-serif; }
+  .extra { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; font-size: 14.5px; line-height: 1.5; }
+  .extra-label { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-right: 4px; }
+  .origin { flex: 1 1 200px; }
+  .check { display: flex; align-items: center; gap: 10px; padding: 7px 0; font-size: 15px; cursor: pointer; }
+  .check input { width: 18px; height: 18px; accent-color: var(--accent); margin: 0; }
+  #extrasBox[open] { padding-bottom: 8px; }
   .missing { color: var(--muted); font-size: 15px; margin-top: 12px; }
   .alts { margin-top: 16px; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .chip { border: 1px solid var(--line); background: transparent; color: var(--ink); border-radius: 999px; padding: 5px 11px; font: 14px var(--sans); cursor: pointer; }
@@ -209,6 +215,13 @@
     </label>
   </details>
 
+  <details class="voice" id="extrasBox">
+    <summary>Extras</summary>
+    <label class="check"><input type="checkbox" data-extra="pron"> Pronunciation</label>
+    <label class="check"><input type="checkbox" data-extra="syn"> Synonyms</label>
+    <label class="check"><input type="checkbox" data-extra="root"> Word origin</label>
+  </details>
+
   <button id="toggle" type="button"></button>
 
   <div class="notice" id="notice"></div>
@@ -231,6 +244,7 @@
 
   <p class="hint">
     Say a single word and pause. Anything longer — a sentence, a conversation — is ignored.
+    Misheard? Spell it out letter by letter (“e p h e m e r a l”).
     Say <b>“again”</b> to hear the last definition once more. Keep this screen open while you read.
   </p>
 </main>
@@ -246,14 +260,17 @@
   const IGNORE = new Set(('yes no yeah yep nope ok okay hmm hm um uh ah oh mm mhm hi hey hello bye thanks ' +
     'what huh wait sorry right sure cool nice wow please stop').split(' '));
   const REPEAT = new Set(['again', 'repeat']);
-  // Words too common to be worth prefetching while speech is still interim.
+  // Words too common to prefetch or show early while speech is still interim — including sentence openers,
+  // so "Actually, I think…" doesn't flash a card.
   const COMMON = new Set(('the and but for you she he they we it this that there then with have what when ' +
-    'where which just like so well now also can could would should').split(' '));
+    'where which just like so well now also can could would should actually anyway basically honestly ' +
+    'listen look maybe really because though alright okay yeah sure right').split(' '));
 
   const load = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
   const save = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
   const prefs = load('margin.prefs', { def: true, he: true });
+  prefs.extras = prefs.extras || { pron: false, syn: false, root: false };
   let history = load('margin.history', []);
 
   let listening = false, speaking = false, recActive = false, rec = null, wakeLock = null;
@@ -272,6 +289,11 @@
       prefs.def = optDef.checked; prefs.he = optHe.checked; save('margin.prefs', prefs);
       if (!prefs.def && canSpeak) speechSynthesis.cancel();
     });
+  }
+
+  for (const box of document.querySelectorAll('[data-extra]')) {
+    box.checked = !!prefs.extras[box.dataset.extra];
+    box.addEventListener('change', () => { prefs.extras[box.dataset.extra] = box.checked; save('margin.prefs', prefs); });
   }
 
   const ICON_MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>';
@@ -318,6 +340,8 @@
     if (r.def && r.def.pos) html += `<span class="pos">${esc(r.def.pos)}</span>`;
     if (r.def && canSpeak) html += `<button class="replay" type="button" aria-label="Read aloud again" data-act="replay">${ICON_SPEAK}</button>`;
     html += `</div>`;
+    const x = r.extras || {};
+    if (x.ipa) html += `<div class="ipa">${esc(x.ipa)}</div>`;
     if (r.wantDef) {
       html += r.def === undefined ? SKELETON
         : r.def ? `<p class="def">${esc(r.def.text)}</p>` : `<p class="missing">No English definition found.</p>`;
@@ -325,14 +349,15 @@
     if (r.wantHe) {
       html += `<div class="he-block${r.wantDef ? '' : ' solo'}">`;
       if (r.he === undefined) html += SKELETON;
-      else if (r.he) {
-        const unsure = r.he.explain && !r.he.dict;
-        if (r.he.main) html += `<div class="${unsure ? 'he-alts' : 'he'}" dir="rtl" lang="he">${esc(r.he.main)}</div>`;
-        if (r.he.alts.length) html += `<div class="he-alts" dir="rtl" lang="he">${r.he.alts.map(esc).join(' · ')}</div>`;
-        if (r.he.explain) html += `<div class="he-explain" dir="rtl" lang="he">${esc(r.he.explain)}</div>`;
-      } else html += `<p class="missing">No Hebrew translation found.</p>`;
+      else if (r.he && r.he.main) html += `<div class="he" dir="rtl" lang="he">${esc(r.he.main)}</div>`;
+      else html += `<p class="missing">No Hebrew translation found.</p>`;
       html += `</div>`;
     }
+    if (x.syn && x.syn.length) {
+      html += `<div class="extra"><span class="extra-label">Similar</span>` +
+        x.syn.map((s) => `<button class="chip" type="button" data-word="${esc(s)}">${esc(s)}</button>`).join('') + `</div>`;
+    }
+    if (x.root) html += `<div class="extra"><span class="extra-label">Origin</span><span class="origin">${esc(x.root)}</span></div>`;
     if (r.alts && r.alts.length) {
       html += `<div class="alts">Meant something else?` +
         r.alts.map((a) => `<button class="chip" type="button" data-word="${esc(a)}">${esc(a)}</button>`).join('') + `</div>`;
@@ -423,30 +448,94 @@
   const POS = { n: 'noun', v: 'verb', adj: 'adjective', adv: 'adverb', u: '' };
   const SKIP_DEF = /surname|given name|plural of|alternative (form|spelling) of|misspelling of|abbreviation of/i;
 
-  // Pick the first ordinary sense, keeping it short enough to hear in a few seconds.
+  const wordCount = (s) => s.split(/\s+/).filter(Boolean).length;
+  // Cut a definition down to its core: drop asides after ; : ( — and "especially…"/"such as…" tails.
+  function coreOf(text) {
+    // Only cut when at least 3 words remain ("The width, usually measured…" stays whole).
+    const cut = (t, re) => { const head = t.split(re)[0]; return wordCount(head) >= 3 ? head : t; };
+    // Drop bracketed asides ("defining an object (usually a function) in terms of itself") rather than cutting there.
+    let t = text.replace(/\s*\([^()]*\)/g, '');
+    t = cut(t, /(?<!\b(?:e\.g|i\.e|etc|esp|approx))\.\s|;\s|:\s|\s—\s|\s–\s/);
+    t = cut(t, /,\s(?:especially|usually|often|typically|particularly|chiefly|mainly|such as|as in|as with|e\.g\.|i\.e\.|including|or of|or in)\b/i);
+    return t.replace(/[\s;:,.]+$/, '');
+  }
+
+  // Pick a very short sense. Dictionaries list the most common sense first, so stay with it when it's
+  // reasonably short; otherwise take a nearby short one; otherwise the shortest of the top three.
   // defs: [{pos, text}] in the source's order.
   function pickDefinition(defs) {
     const clean = defs
-      .map((d) => ({ pos: d.pos, text: d.text.replace(/^(\s*\([^)]*\)\s*)+/, '').replace(/\s+/g, ' ').trim() }))
+      .filter((d) => !/^\s*\([^)]*\b(obsolete|archaic|rare|dated|historical)\b/i.test(d.text))
+      .map((d) => ({ pos: d.pos, text: coreOf(d.text.replace(/^(\s*\([^)]*\)\s*)+/, '').replace(/\s+/g, ' ').trim()) }))
       .filter((d) => d.text && !SKIP_DEF.test(d.text));
     if (!clean.length) return null;
-    let d = clean[0];
-    if (d.text.length > 160) d = clean.slice(0, 4).filter((x) => x.text.length <= 160)[0] || d;
-    let text = d.text.length > 160 ? d.text.split(/(?<=[.;:])\s/)[0] : d.text;
-    text = text.replace(/[\s;:,]+$/, '');
+    // Senses like "Such a store of…" only make sense after the one before them.
+    // Fallbacks must be the same word type as the main sense ("pragmatic" the adjective, not the rare noun).
+    const top = clean.slice(0, 3).filter((x, i) => i === 0 || (x.pos === clean[0].pos && !/^(such|this|that|these|the same)\b/i.test(x.text)));
+    const d = (wordCount(top[0].text) <= 16 && top[0])
+      || top.slice(1).find((x) => wordCount(x.text) <= 10)
+      || top.slice().sort((a, b) => wordCount(a.text) - wordCount(b.text))[0];
+    let text = d.text;
     if (!/[.!?]$/.test(text)) text += '.';
     return { pos: d.pos, text: text[0].toUpperCase() + text.slice(1) };
   }
 
   async function datamuseDef(w) {
-    const data = await fetchJSON('https://api.datamuse.com/words?md=d&max=1&sp=' + encodeURIComponent(w), 3000);
+    const data = await fetchJSON('https://api.datamuse.com/words?md=dr&ipa=1&max=1&sp=' + encodeURIComponent(w), 3000);
     const hit = Array.isArray(data) && data[0];
     if (!hit || hit.word !== w || !hit.defs) return null;
-    return pickDefinition(hit.defs.map((s) => {
+    const d = pickDefinition(hit.defs.map((s) => {
       const [p, ...rest] = s.split('\t');
       return { pos: POS[p] ?? p, text: rest.join(' ') };
     }));
+    const ipa = (hit.tags || []).find((t) => t.startsWith('ipa_pron:'));
+    if (d && ipa) d.ipa = '/' + ipa.slice(9).trim() + '/';
+    return d;
   }
+
+  // Closest real spelling (Datamuse corrects near misses, e.g. "ephmeral" → "ephemeral").
+  async function correctSpelling(w) {
+    const data = await fetchJSON('https://api.datamuse.com/words?max=1&sp=' + encodeURIComponent(w), 3000).catch(() => null);
+    return (Array.isArray(data) && data[0] && data[0].word) || null;
+  }
+
+  // ---------- Extras: synonyms (Datamuse), pronunciation + word origin (Wiktionary) ----------
+  const getSyn = cached(new Map(), async (w) => {
+    const q = encodeURIComponent(w);
+    const freq = (x) => +(((x.tags || []).find((t) => t.startsWith('f:')) || 'f:0').slice(2));
+    const single = (list) => (list || []).filter((x) => !x.word.includes(' ') && x.word !== w);
+    // Most common first, so the synonyms are simpler words.
+    const syn = single(await fetchJSON('https://api.datamuse.com/words?md=f&max=15&rel_syn=' + q, 3000)).sort((a, b) => freq(b) - freq(a));
+    if (syn.length) return syn.slice(0, 3).map((x) => x.word);
+    // No listed synonyms: fall back to Datamuse's closest "means like" words (already ranked by closeness).
+    return single(await fetchJSON('https://api.datamuse.com/words?max=6&ml=' + q, 3000)).slice(0, 3).map((x) => x.word);
+  });
+
+  // Wiktionary etymologies are dense ("from Ancient Greek ἐφήμερος (ephḗmeros, “…”)") — keep the readable part.
+  function shortOrigin(t) {
+    let s = t.replace(/‎/g, '')
+      .replace(/[^\s()]*[Ͱ-᷿⺀-￿][^\s()]*/g, '')          // words in non-Latin scripts
+      .replace(/\(\s*([^,()“”]+?),\s*(“[^”]*”)\s*\)/g, '$1 $2')               // (translit, “gloss”) → translit “gloss”
+      .replace(/\(\s*([^,()“”]+?)\s*\)/g, '$1')                                // (translit) → translit
+      .replace(/\(\s*\)/g, '')
+      .replace(/\s+/g, ' ').replace(/\s+([,.;])/g, '$1').trim();
+    s = s.split(/(?<=\.)\s(?=[A-Z])/)[0];
+    const words = s.split(' ');
+    return words.length > 22 ? words.slice(0, 22).join(' ').replace(/[,;:(“]+$/, '') + '…' : s;
+  }
+
+  const getWikt = cached(new Map(), async (w) => {
+    const data = await fetchJSON('https://en.wiktionary.org/w/api.php?action=query&prop=extracts&explaintext=1&format=json&origin=*&redirects=1&titles=' + encodeURIComponent(w), 5000);
+    const page = data && data.query && Object.values(data.query.pages)[0];
+    const text = (page && page.extract) || '';
+    const i = text.indexOf('== English ==');
+    if (i < 0) return null;
+    const en = text.slice(i + 13).split(/\n== [^=]/)[0];
+    const et = en.match(/=== Etymology(?: \d+)? ===\s*\n+([^\n]+)/);
+    const ipas = [...en.matchAll(/^(.*)IPA\(key\):\s*(\/[^/]+\/)/gm)];
+    const us = ipas.find((m) => /\((US|General American|GA)\)/.test(m[1])) || ipas[0];
+    return { root: et ? shortOrigin(et[1]) : '', ipa: us ? us[2] : '' };
+  });
 
   async function wiktionaryDef(w) {
     const data = await fetchJSON('https://en.wiktionary.org/api/rest_v1/page/definition/' + encodeURIComponent(w), 4000);
@@ -490,10 +579,13 @@
 
   // Definition and Hebrew are fetched in parallel and each is shown the moment it arrives.
   // In r, undefined = still loading, null = not found.
-  async function lookupAndShow(word, alts) {
+  // early: shown from Chrome's partial result before it confirms the word — shown but not spoken or
+  // saved until confirmEarly() runs (or thrown away by retractEarly()).
+  async function lookupAndShow(word, alts, early = false) {
     const my = ++seq;
     const live = () => my === seq;
-    const r = { word, def: undefined, he: undefined, alts: [], wantDef: prefs.def, wantHe: prefs.he };
+    if (!early) pendingEarly = null;
+    const r = { word, def: undefined, he: undefined, alts: [], wantDef: prefs.def, wantHe: prefs.he, early, done: false, extras: null };
     current = r;
     render(r);
     setStatus('looking');
@@ -511,7 +603,7 @@
       r.def = def;
       r.alts = [word, ...alts].filter((a, i, arr) => a !== used && arr.indexOf(a) === i).slice(0, 3);
       render(r);
-      if (def) speakResult(r);
+      if (def && !r.early) speakResult(r);
     })();
 
     const heTask = !r.wantHe ? Promise.resolve() : (async () => {
@@ -519,24 +611,78 @@
       if (!live()) return;
       if (r.word === word) { r.he = first; render(r); }
       await defTask;
-      if (!live()) return;
-      let he = r.word === word ? first : await getHe(r.word);
-      // Rare words often get a one-word guess with no dictionary backing (e.g. "serendipity" → "calm").
-      // Then also translate the English meaning so the Hebrew reader gets the real sense.
-      if (!he || !he.dict) {
-        const meaning = r.def || await getDef(r.word);
-        const explain = meaning ? await toHebrew(meaning.text) : null;
-        if (explain) he = { ...(he || { main: '', alts: [] }), explain: explain.main };
-      }
-      if (!live()) return;
-      r.he = he;
-      render(r);
+      if (!live() || r.word === word) return;
+      r.he = await getHe(r.word);
+      if (live()) render(r);
     })();
 
-    await Promise.all([defTask, heTask]);
+    const ex = prefs.extras || {};
+    const extrasTask = !(ex.pron || ex.syn || ex.root) ? Promise.resolve() : (async () => {
+      await defTask;   // the heard word may be swapped for a better alternative first
+      if (!live()) return;
+      const w = r.word;
+      r.extras = {};
+      const jobs = [];
+      if (ex.syn) jobs.push(getSyn(w).then((s) => { if (live()) { r.extras.syn = s || []; render(r); } }));
+      if (ex.pron || ex.root) jobs.push((async () => {
+        let info = await getWikt(w);
+        // Inflected forms ("wandered") have no origin of their own — use the base word's.
+        if (ex.root && !(info && info.root)) {
+          for (const f of baseForms(w).slice(1)) { const b = await getWikt(f); if (b && b.root) { info = { ...(info || {}), root: b.root }; break; } }
+        }
+        if (!live()) return;
+        if (ex.pron) r.extras.ipa = (info && info.ipa) || (r.def && r.def.ipa) || '';
+        if (ex.root) r.extras.root = (info && info.root) || '';
+        render(r);
+      })());
+      await Promise.all(jobs);
+    })();
+
+    await Promise.all([defTask, heTask, extrasTask]);
     if (!live()) return;
+    r.done = true;
     setStatus();
-    if (r.def || r.he) addHistory(r);
+    if (!r.early && (r.def || r.he)) addHistory(r);
+  }
+
+  // ---------- Early showing ----------
+  // If Chrome's partial result is a single word and nothing new arrives for 0.35 s, you've almost
+  // certainly stopped talking: show the card now instead of waiting ~0.5–1 s for Chrome's final.
+  const EARLY_MS = 350;
+  let pendingEarly = null, earlyTimer = null;
+
+  function showEarly(w) {
+    if (speaking || (pendingEarly && pendingEarly.word === w)) return;
+    if (current && current.word === w && Date.now() - lastHeard.t < 2500) return;
+    const prev = current;
+    lookupAndShow(w, [], true);
+    pendingEarly = { word: w, r: current, prev };
+  }
+
+  // Chrome confirmed the same word: now read it aloud and save it.
+  function confirmEarly(alts) {
+    const { r } = pendingEarly;
+    pendingEarly = null;
+    if (r !== current) return;
+    if (r.wantDef && r.def === null && alts.length) { lookupAndShow(r.word, alts); return; }   // try its alternatives
+    r.early = false;
+    r.alts = alts.filter((a) => a !== r.word).slice(0, 3);
+    render(r);
+    if (r.def) speakResult(r);
+    if (r.done && (r.def || r.he)) addHistory(r);
+  }
+
+  // It turned out to be the start of a sentence: quietly put back what was there before.
+  function retractEarly() {
+    clearTimeout(earlyTimer);
+    if (!pendingEarly) return;
+    const { r, prev } = pendingEarly;
+    pendingEarly = null;
+    if (r !== current) return;
+    seq++;
+    current = prev;
+    prev ? render(prev) : renderEmpty();
+    setStatus();
   }
 
   // ---------- Speech out ----------
@@ -880,16 +1026,49 @@
     try { rec.start(); recActive = true; } catch {}
   }
 
+  // Spelling a word out ("e p h e m e r a l") arrives as separate letters, sometimes as letter names.
+  const LETTER_NAMES = {
+    be: 'b', bee: 'b', see: 'c', sea: 'c', dee: 'd', ee: 'e', eff: 'f', ef: 'f', gee: 'g', aitch: 'h', eye: 'i',
+    jay: 'j', kay: 'k', el: 'l', ell: 'l', em: 'm', en: 'n', oh: 'o', pee: 'p', pea: 'p', queue: 'q', cue: 'q',
+    are: 'r', ar: 'r', es: 's', ess: 's', tea: 't', tee: 't', you: 'u', vee: 'v', ex: 'x', why: 'y', zee: 'z', zed: 'z',
+  };
+  function spelledWord(text) {
+    const toks = text.toLowerCase().replace(/[^a-z\s.\-]/g, ' ').split(/[\s.\-]+/).filter(Boolean);
+    if (toks.length < 3) return null;
+    const letters = toks.map((t) => (t.length === 1 ? t : LETTER_NAMES[t]));
+    if (letters.some((l) => !l)) return null;
+    // Mostly real single letters, so a sentence like "see you" isn't mistaken for spelling.
+    if (toks.filter((t) => t.length === 1).length < Math.ceil(toks.length * 0.6)) return null;
+    return letters.join('');
+  }
+
+  async function heardSpelled(w) {
+    retractEarly();
+    lastHeard = { w, t: Date.now() };
+    showLive('spelled: ' + w);
+    // Fix a misheard letter or two ("ephmeral" → "ephemeral").
+    const fixed = (await getDef(w)) ? w : (await correctSpelling(w)) || w;
+    lookupAndShow(fixed, []);
+  }
+
   function onResult(e) {
+    clearTimeout(earlyTimer);
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const res = e.results[i];
       const text = res[0].transcript;
-      const words = tokens(text);
       showLive(text.trim());
-      if (words.length !== 1) continue;           // longer speech is ignored
+      if (res.isFinal) {
+        const spelled = spelledWord(text);
+        if (spelled) { restartDelay = 250; notice(''); heardSpelled(spelled); continue; }
+      }
+      const words = tokens(text);
+      if (words.length !== 1) { if (words.length > 1) retractEarly(); continue; }   // longer speech is ignored
       const w = words[0];
       if (!res.isFinal) {
-        if (w.length > 3 && !COMMON.has(w) && !IGNORE.has(w)) prefetch(w);
+        if (w.length > 3 && !COMMON.has(w) && !IGNORE.has(w) && !REPEAT.has(w)) {
+          prefetch(w);
+          earlyTimer = setTimeout(() => showEarly(w), EARLY_MS);
+        }
         continue;
       }
       restartDelay = 250;
@@ -904,6 +1083,10 @@
   }
 
   function heard(w, alts) {
+    if (pendingEarly) {
+      if (pendingEarly.word === w) { lastHeard = { w, t: Date.now() }; confirmEarly(alts); return; }
+      retractEarly();
+    }
     const now = Date.now();
     if (w === lastHeard.w && now - lastHeard.t < 2500) return;
     lastHeard = { w, t: now };
