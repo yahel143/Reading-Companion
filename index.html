@@ -77,6 +77,19 @@
   .shake { animation: shake .35s; }
   @keyframes shake { 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
 
+  /* Voice settings */
+  .voice { margin-top: 10px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); padding: 0 14px; }
+  .voice summary { cursor: pointer; padding: 12px 0; font-size: 14px; font-weight: 600; color: var(--muted); list-style: none; }
+  .voice summary::-webkit-details-marker { display: none; }
+  .voice summary::after { content: "▾"; float: right; transition: transform .15s; }
+  .voice[open] summary::after { transform: rotate(180deg); }
+  .voice[open] { padding-bottom: 14px; }
+  .field { display: block; margin-bottom: 12px; font-size: 14px; }
+  .field span { display: flex; justify-content: space-between; margin-bottom: 6px; color: var(--muted); }
+  .field select { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: 15px var(--sans); }
+  .field input[type=range] { width: 100%; accent-color: var(--accent); }
+  .voice .small { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin: 12px 0 0; }
+
   /* Start / stop */
   #toggle {
     width: 100%; margin-top: 14px; padding: 16px; border: 0; border-radius: 14px;
@@ -170,6 +183,20 @@
       <span><b>Hebrew</b><span class="sub">Translation shown on screen</span></span>
     </label>
   </div>
+
+  <details class="voice" id="voiceBox">
+    <summary>Voice</summary>
+    <label class="field">
+      <span>Speaker</span>
+      <select id="voiceSel"></select>
+    </label>
+    <label class="field">
+      <span>Speed <b id="rateVal"></b></span>
+      <input type="range" id="rateSel" min="0.7" max="1.3" step="0.05">
+    </label>
+    <button type="button" class="chip" id="voicePreview">▶ Preview</button>
+    <p class="small">Want more voices? Android: Settings → search “Text-to-speech” → Google engine ⚙ → Install voice data → English. iPhone: Settings → Accessibility → Spoken Content → Voices → English → download an “Enhanced” or “Premium” voice.</p>
+  </details>
 
   <button id="toggle" type="button"></button>
 
@@ -491,17 +518,48 @@
 
   // ---------- Speech out ----------
   let voice = null;
-  function pickVoice() {
-    if (!canSpeak) return;
-    const vs = speechSynthesis.getVoices().filter((v) => /^en[-_]/i.test(v.lang));
-    voice = vs.find((v) => /en[-_]US/i.test(v.lang) && /google|samantha|natural|enhanced/i.test(v.name))
-      || vs.find((v) => /en[-_]US/i.test(v.lang)) || vs[0] || null;
+  // Higher = sounds more human. Neural/online voices beat the robotic offline ones.
+  function voiceScore(v) {
+    let s = 0;
+    if (/natural|neural|premium|enhanced|wavenet|journey|studio/i.test(v.name)) s += 10;
+    if (/online/i.test(v.name) || v.localService === false) s += 4;
+    if (/^google/i.test(v.name)) s += 3;
+    if (/samantha|ava|zoe|allison|susan|serena|daniel|karen|moira/i.test(v.name)) s += 3;
+    if (/en[-_]US/i.test(v.lang)) s += 2; else if (/en[-_](GB|AU|IE|CA)/i.test(v.lang)) s += 1;
+    if (/compact|espeak|robot|whisper|bad news|bells|boing|bubbles|cellos|jester|organ|trinoids|zarvox|superstar|wobble|albert|fred|junior|ralph|kathy|grandma|grandpa|eddy|flo|reed|rocko|sandy|shelley/i.test(v.name)) s -= 20;
+    return s;
   }
-  if (canSpeak) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
+  function englishVoices() {
+    return canSpeak ? speechSynthesis.getVoices().filter((v) => /^en[-_]/i.test(v.lang)).sort((a, b) => voiceScore(b) - voiceScore(a)) : [];
+  }
+  function pickVoice() {
+    const vs = englishVoices();
+    voice = vs.find((v) => v.voiceURI === prefs.voice) || vs[0] || null;
+    const sel = $('#voiceSel');
+    sel.innerHTML = '<option value="">Automatic — most natural available</option>' +
+      vs.map((v) => `<option value="${esc(v.voiceURI)}">${esc(v.name.replace(/^Microsoft |^Google /, ''))} · ${esc(v.lang)}</option>`).join('');
+    sel.value = vs.some((v) => v.voiceURI === prefs.voice) ? prefs.voice : '';
+  }
+  if (canSpeak) {
+    pickVoice();
+    speechSynthesis.onvoiceschanged = pickVoice;
+    $('#voiceSel').addEventListener('change', (e) => { prefs.voice = e.target.value; save('margin.prefs', prefs); pickVoice(); preview(); });
+    const rate = $('#rateSel');
+    rate.value = prefs.rate || 0.95;
+    const showRate = () => ($('#rateVal').textContent = (+rate.value).toFixed(2).replace(/0$/, '') + '×');
+    showRate();
+    rate.addEventListener('input', showRate);
+    rate.addEventListener('change', () => { prefs.rate = +rate.value; save('margin.prefs', prefs); preview(); });
+    $('#voicePreview').addEventListener('click', preview);
+  } else {
+    $('#voiceBox').style.display = 'none';
+  }
+  function preview() { say('Ephemeral: lasting for a very short time.'); }
 
   function speakResult(r) {
     if (!r.def) return;
-    say(`${r.word}. ${r.def.text}`);
+    // A colon gives a natural pause between the word and its meaning.
+    say(`${r.word}: ${r.def.text}`);
   }
 
   function say(text) {
@@ -514,7 +572,7 @@
     const u = new SpeechSynthesisUtterance(text);
     if (voice) u.voice = voice;
     u.lang = voice ? voice.lang : 'en-US';
-    u.rate = 0.95;
+    u.rate = prefs.rate || 0.95;
     let done = false;
     const finish = () => {
       if (done) return;
