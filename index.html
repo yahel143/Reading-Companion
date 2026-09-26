@@ -931,10 +931,11 @@
 
   async function say(text) {
     const my = ++sayId;
-    // Pause the microphone so the phone doesn't hear itself.
+    // The microphone stays on while the app talks: stopping and restarting it makes iPhones play a tone
+    // each time. The app's own voice is filtered out in onResult instead (see withoutEcho).
     speaking = true;
     setStatus();
-    if (rec && recActive) { try { rec.abort(); } catch {} }
+    spokenWords = new Set(tokens(text));
     if (canSpeak) speechSynthesis.cancel();
     stopAudio();
     let done = false, fallback = null;
@@ -943,8 +944,9 @@
       done = true;
       clearTimeout(fallback);
       speaking = false;
+      speechEndedAt = Date.now();
       setStatus();
-      if (listening) setTimeout(startRec, 200);
+      if (listening) setTimeout(startRec, 200);   // only needed if the phone ended listening meanwhile
     };
 
     if (aiReady()) {
@@ -1051,17 +1053,28 @@
     lookupAndShow(fixed, []);
   }
 
+  // The mic stays on while the app talks, so it hears its own voice. Echo rules:
+  //  - ignore everything while speaking and for ECHO_QUIET_MS after;
+  //  - for a few seconds after, drop words that were just spoken ("…a very short time wistful" → "wistful").
+  const ECHO_QUIET_MS = 600, ECHO_WORDS_MS = 4000;
+  let spokenWords = new Set(), speechEndedAt = 0;
+  const hearingItself = () => speaking || Date.now() - speechEndedAt < ECHO_QUIET_MS;
+  function withoutEcho(words) {
+    return Date.now() - speechEndedAt < ECHO_WORDS_MS ? words.filter((w) => !spokenWords.has(w)) : words;
+  }
+
   function onResult(e) {
     clearTimeout(earlyTimer);
     for (let i = e.resultIndex; i < e.results.length; i++) {
       const res = e.results[i];
       const text = res[0].transcript;
+      if (hearingItself()) continue;
       showLive(text.trim());
       if (res.isFinal) {
         const spelled = spelledWord(text);
         if (spelled) { restartDelay = 250; notice(''); heardSpelled(spelled); continue; }
       }
-      const words = tokens(text);
+      const words = withoutEcho(tokens(text));
       if (words.length !== 1) { if (words.length > 1) retractEarly(); continue; }   // longer speech is ignored
       const w = words[0];
       if (!res.isFinal) {
