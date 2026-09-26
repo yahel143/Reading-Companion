@@ -298,12 +298,7 @@
     card.innerHTML = listening ? '<p>Say a word you don’t know.</p>' : '<p>Choose what you want above,<br>then tap <b>Start reading</b>.</p>';
   }
 
-  function renderLoading(word) {
-    const card = $('#card');
-    card.className = '';
-    card.innerHTML = `<div class="word-row"><h2 class="word">${esc(word)}</h2></div>
-      <div class="skeleton" style="width:90%"></div><div class="skeleton" style="width:60%"></div>`;
-  }
+  const SKELETON = '<div class="skeleton" style="width:90%"></div><div class="skeleton" style="width:60%"></div>';
 
   function render(r) {
     const card = $('#card');
@@ -313,11 +308,13 @@
     if (r.def && canSpeak) html += `<button class="replay" type="button" aria-label="Read aloud again" data-act="replay">${ICON_SPEAK}</button>`;
     html += `</div>`;
     if (r.wantDef) {
-      html += r.def ? `<p class="def">${esc(r.def.text)}</p>` : `<p class="missing">No English definition found.</p>`;
+      html += r.def === undefined ? SKELETON
+        : r.def ? `<p class="def">${esc(r.def.text)}</p>` : `<p class="missing">No English definition found.</p>`;
     }
     if (r.wantHe) {
       html += `<div class="he-block${r.wantDef ? '' : ' solo'}">`;
-      if (r.he) {
+      if (r.he === undefined) html += SKELETON;
+      else if (r.he) {
         const unsure = r.he.explain && !r.he.dict;
         if (r.he.main) html += `<div class="${unsure ? 'he-alts' : 'he'}" dir="rtl" lang="he">${esc(r.he.main)}</div>`;
         if (r.he.alts.length) html += `<div class="he-alts" dir="rtl" lang="he">${r.he.alts.map(esc).join(' · ')}</div>`;
@@ -480,40 +477,55 @@
     if (prefs.he) getHe(w);
   }
 
-  async function resolve(word, alts) {
-    const wantDef = prefs.def, wantHe = prefs.he;
-    const heFirst = wantHe ? getHe(word) : null;
-    let def = null, used = word;
-    if (wantDef) {
+  // Definition and Hebrew are fetched in parallel and each is shown the moment it arrives.
+  // In r, undefined = still loading, null = not found.
+  async function lookupAndShow(word, alts) {
+    const my = ++seq;
+    const live = () => my === seq;
+    const r = { word, def: undefined, he: undefined, alts: [], wantDef: prefs.def, wantHe: prefs.he };
+    current = r;
+    render(r);
+    setStatus('looking');
+
+    const defTask = !r.wantDef ? Promise.resolve() : (async () => {
       // If the recognizer's top guess isn't a real word, fall back to its alternatives.
+      let def = null, used = word;
       for (const c of [word, ...alts]) {
         def = await getDef(c);
         if (def) { used = c; break; }
       }
-    }
-    let he = wantHe ? await (used === word ? heFirst : getHe(used)) : null;
-    // Rare words often get a one-word guess with no dictionary backing (e.g. "serendipity" → "calm").
-    // Then also translate the English meaning so the Hebrew reader gets the real sense.
-    if (wantHe && (!he || !he.dict)) {
-      const meaning = def || await getDef(used);
-      const explain = meaning ? await toHebrew(meaning.text) : null;
-      if (explain) he = { ...(he || { main: '', alts: [] }), explain: explain.main };
-    }
-    const others = [word, ...alts].filter((a, i, arr) => a !== used && arr.indexOf(a) === i).slice(0, 3);
-    return { word: used, def, he, alts: others, wantDef, wantHe };
-  }
+      if (!live()) return;
+      if (used !== word) r.he = undefined;   // Hebrew shown so far was for the misheard word
+      r.word = used;
+      r.def = def;
+      r.alts = [word, ...alts].filter((a, i, arr) => a !== used && arr.indexOf(a) === i).slice(0, 3);
+      render(r);
+      if (def) speakResult(r);
+    })();
 
-  async function lookupAndShow(word, alts) {
-    const my = ++seq;
-    renderLoading(word);
-    setStatus('looking');
-    const r = await resolve(word, alts);
-    if (my !== seq) return;
-    current = r;
-    render(r);
+    const heTask = !r.wantHe ? Promise.resolve() : (async () => {
+      const first = await getHe(word);
+      if (!live()) return;
+      if (r.word === word) { r.he = first; render(r); }
+      await defTask;
+      if (!live()) return;
+      let he = r.word === word ? first : await getHe(r.word);
+      // Rare words often get a one-word guess with no dictionary backing (e.g. "serendipity" → "calm").
+      // Then also translate the English meaning so the Hebrew reader gets the real sense.
+      if (!he || !he.dict) {
+        const meaning = r.def || await getDef(r.word);
+        const explain = meaning ? await toHebrew(meaning.text) : null;
+        if (explain) he = { ...(he || { main: '', alts: [] }), explain: explain.main };
+      }
+      if (!live()) return;
+      r.he = he;
+      render(r);
+    })();
+
+    await Promise.all([defTask, heTask]);
+    if (!live()) return;
     setStatus();
     if (r.def || r.he) addHistory(r);
-    if (r.wantDef && r.def) speakResult(r);
   }
 
   // ---------- Speech out ----------
