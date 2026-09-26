@@ -337,7 +337,7 @@
     const card = $('#card');
     card.className = '';
     let html = `<div class="word-row"><h2 class="word">${esc(r.word)}</h2>`;
-    if (r.def && r.def.pos) html += `<span class="pos">${esc(r.def.pos)}</span>`;
+    if (r.def && (r.def.pos || r.def.from)) html += `<span class="pos">${esc([r.def.pos, r.def.from && 'from ' + r.def.from].filter(Boolean).join(' · '))}</span>`;
     if (r.def && canSpeak) html += `<button class="replay" type="button" aria-label="Read aloud again" data-act="replay">${ICON_SPEAK}</button>`;
     html += `</div>`;
     const x = r.extras || {};
@@ -460,36 +460,128 @@
     return t.replace(/[\s;:,.]+$/, '');
   }
 
+  // ---------- Circular definitions ("fastidiously: in a fastidious manner") ----------
+  // Guess a word's root with spelling rules (no AI); the dictionary later confirms which guess is real.
+  function rootCandidates(w) {
+    const out = [];
+    const add = (s) => { if (s && s.length >= 3 && s !== w && !out.includes(s)) out.push(s); };
+    const cut = (n) => w.slice(0, -n);
+    if (w.endsWith('ically')) add(cut(4));                         // basically → basic
+    if (/[ai]bly$/.test(w)) add(cut(1) + 'e');                     // comfortably → comfortable
+    if (w.endsWith('ily')) add(cut(3) + 'y');                      // happily → happy
+    if (w.endsWith('ly')) add(cut(2));                             // fastidiously → fastidious
+    if (w.endsWith('iness')) add(cut(5) + 'y');                    // happiness → happy
+    if (w.endsWith('ness')) add(cut(4));                           // kindness → kind
+    if (w.endsWith('ity')) { add(cut(3)); add(cut(3) + 'e'); }     // scarcity → scarce
+    if (w.endsWith('ment')) add(cut(4));                           // amazement → amaze
+    if (w.endsWith('ful')) add(cut(3));                            // wistful → wist (harmless if not a word)
+    for (const f of baseForms(w).slice(1)) add(f);                 // -ing, -ed, -s, -ies …
+    return out.slice(0, 4);
+  }
+
+  // What marks a definition as circular: words starting with a stem ("fastidious", "happ", "trudg"…),
+  // or — for 3-letter roots like "sad" in "sadness" — that exact word.
+  function stemsOf(w) {
+    const prefixes = new Set(), exact = new Set();
+    for (const r of [w, ...rootCandidates(w)]) {
+      const s = r.replace(/[eyi]$/, '');
+      if (s.length >= 4) prefixes.add(s);
+      else if (r.length === 3) exact.add(r);
+    }
+    return { prefixes: [...prefixes], exact };
+  }
+  const isCircular = (text, stems) => text.toLowerCase().split(/[^a-z]+/).some((t) =>
+    stems.exact.has(t) || (t.length >= 4 && stems.prefixes.some((s) => t.startsWith(s))));
+
+  const lowerFirst = (s) => s[0].toLowerCase() + s.slice(1);
+  const capFirst = (s) => s[0].toUpperCase() + s.slice(1);
+  const noDot = (s) => s.replace(/[.\s]+$/, '');
+  function gerund(v) {                                             // walk → walking, make → making
+    if (/ie$/.test(v)) return v.slice(0, -2) + 'ying';
+    if (/[^e]e$/.test(v)) return v.slice(0, -1) + 'ing';
+    return v + 'ing';
+  }
+  // "walks slowly and heavily" (defining "trudging") → "walking slowly and heavily"
+  function asGerundPhrase(p) {
+    const [v, ...rest] = p.split(' ');
+    const base = /(ch|sh|ss|x)es$/.test(v) ? v.slice(0, -2) : v.replace(/s$/, '');
+    return [gerund(base), ...rest].join(' ');
+  }
+
   // Pick a very short sense. Dictionaries list the most common sense first, so stay with it when it's
   // reasonably short; otherwise take a nearby short one; otherwise the shortest of the top three.
-  // defs: [{pos, text}] in the source's order.
-  function pickDefinition(defs) {
-    const clean = defs
+  // Senses that define the word with itself are skipped, or reduced to their non-circular part.
+  // defs: [{pos, text}] in the source's order. word: the word being defined (for the circular check).
+  function pickDefinition(defs, word) {
+    const stems = word ? stemsOf(word) : { prefixes: [], exact: new Set() };
+    const all = defs
       .filter((d) => !/^\s*\([^)]*\b(obsolete|archaic|rare|dated|historical)\b/i.test(d.text))
-      .map((d) => ({ pos: d.pos, text: coreOf(d.text.replace(/^(\s*\([^)]*\)\s*)+/, '').replace(/\s+/g, ' ').trim()) }))
+      .map((d) => {
+        const raw = d.text.replace(/^(\s*\([^)]*\)\s*)+/, '').replace(/\s+/g, ' ').trim();
+        return { pos: d.pos, raw, text: coreOf(raw) };
+      })
       .filter((d) => d.text && !SKIP_DEF.test(d.text));
-    if (!clean.length) return null;
+    if (!all.length) return null;
+    const finish = (d, text, extra) => {
+      text = noDot(text);
+      return { pos: d.pos, text: capFirst(text) + '.', ...extra };
+    };
+    // The main sense defines the word with itself: keep its non-circular part if it has one
+    // ("The emotion of being happy; joy; elation" → "Joy, elation").
+    const main = all[0];
+    if (isCircular(main.text, stems)) {
+      const parts = main.raw.replace(/\s*\([^()]*\)/g, '').split(/;\s*|,\s+or\s+/).map((p) => noDot(p.trim())).filter(Boolean);
+      const good = parts.filter((p) => !isCircular(p, stems));
+      if (good.length && good.length < parts.length) {
+        let text = good.join(', ');
+        if (/ing$/.test(word) && /^[a-z]+s\b/.test(text)) text = asGerundPhrase(text);
+        return finish(main, text);
+      }
+    }
+    // mainCircular tells getDef to prefer rephrasing the root's meaning over a secondary sense
+    // ("happily" → from "happy", not "by good chance").
+    const mainCircular = isCircular(main.text, stems);
+    const clean = all.filter((d) => !isCircular(d.text, stems));
+    if (!clean.length) return finish(main, main.text, { circular: true });
     // Senses like "Such a store of…" only make sense after the one before them.
     // Fallbacks must be the same word type as the main sense ("pragmatic" the adjective, not the rare noun).
     const top = clean.slice(0, 3).filter((x, i) => i === 0 || (x.pos === clean[0].pos && !/^(such|this|that|these|the same)\b/i.test(x.text)));
     const d = (wordCount(top[0].text) <= 16 && top[0])
       || top.slice(1).find((x) => wordCount(x.text) <= 10)
       || top.slice().sort((a, b) => wordCount(a.text) - wordCount(b.text))[0];
-    let text = d.text;
-    if (!/[.!?]$/.test(text)) text += '.';
-    return { pos: d.pos, text: text[0].toUpperCase() + text.slice(1) };
+    return finish(d, d.text, mainCircular ? { mainCircular: true, pos: main.pos } : {});
   }
 
-  async function datamuseDef(w) {
+  // Rephrase the root's meaning for the derived word: "fastidious: fussy" → "fastidiously: in a way that is fussy".
+  function fromRoot(word, pos, base) {
+    const b = noDot(base.text);
+    let text = base.text;
+    // "Characterized by…", "Showing…" read better as "In a way characterized by…" than "…that is characterized by…".
+    const participle = /^(showing|having|being|feeling|causing|lacking|full of|characteri[sz]ed by|marked by|expressing|displaying|done|made|performed|acting|with)\b/i.test(b);
+    if ((pos === 'adverb' || /ly$/.test(word)) && base.pos === 'adjective') text = (participle ? 'In a way ' : 'In a way that is ') + lowerFirst(b) + '.';
+    else if (/(ness|ity)$/.test(word) && base.pos === 'adjective') text = (participle ? 'The quality of ' : 'Being ') + lowerFirst(b) + '.';
+    else if (/ing$/.test(word) && base.pos === 'verb' && /^to\s/i.test(b)) text = capFirst(asGerundPhrase(b.slice(3).replace(/^([a-z]+)/, '$1s'))) + '.';
+    return { pos: pos || base.pos, text, from: base.word };
+  }
+
+  // Raw Datamuse entry for exactly this word: { word, defs: [{pos, text}], ipa } or null.
+  const datamuseRaw = cached(new Map(), async (w) => {
     const data = await fetchJSON('https://api.datamuse.com/words?md=dr&ipa=1&max=1&sp=' + encodeURIComponent(w), 3000);
     const hit = Array.isArray(data) && data[0];
     if (!hit || hit.word !== w || !hit.defs) return null;
-    const d = pickDefinition(hit.defs.map((s) => {
-      const [p, ...rest] = s.split('\t');
-      return { pos: POS[p] ?? p, text: rest.join(' ') };
-    }));
     const ipa = (hit.tags || []).find((t) => t.startsWith('ipa_pron:'));
-    if (d && ipa) d.ipa = '/' + ipa.slice(9).trim() + '/';
+    return {
+      word: w,
+      defs: hit.defs.map((s) => { const [p, ...rest] = s.split('\t'); return { pos: POS[p] ?? p, text: rest.join(' ') }; }),
+      ipa: ipa ? '/' + ipa.slice(9).trim() + '/' : '',
+    };
+  });
+
+  // forWord: the word we're explaining. A root's sense is judged against *that* word, so "graceful: showing
+  // grace" is fine for explaining "gracefully" even though it's circular for "graceful" itself.
+  function defFromRaw(raw, forWord) {
+    const d = raw && pickDefinition(raw.defs, forWord || raw.word);
+    if (d && raw.ipa) d.ipa = raw.ipa;
     return d;
   }
 
@@ -542,15 +634,28 @@
     const strip = (html) => { const el = document.createElement('div'); el.innerHTML = html; return el.textContent; };
     const defs = ((data && data.en) || []).flatMap((m) =>
       (m.definitions || []).map((d) => ({ pos: (m.partOfSpeech || '').toLowerCase(), text: strip(d.definition || '') })));
-    return pickDefinition(defs);
+    return pickDefinition(defs, w);
   }
 
   const getDef = cached(new Map(), async (w) => {
-    for (const form of baseForms(w)) {
-      const d = await datamuseDef(form).catch(() => null);
-      if (d) return d;
+    // Ask for the word and its guessed roots at the same time, so if the word's own definition turns out
+    // to be circular (or missing), the root's definition is already here — no extra wait.
+    const roots = rootCandidates(w);
+    const rootJobs = roots.map((r) => datamuseRaw(r));
+    const own = defFromRaw(await datamuseRaw(w));
+    if (own && !own.circular && !own.mainCircular) return own;
+    for (let i = 0; i < roots.length; i++) {
+      const raw = await rootJobs[i];
+      if (!raw) continue;
+      if (!own) { const base = defFromRaw(raw); if (base) return base; continue; }   // an inflected form the dictionary lacks
+      const base = defFromRaw(raw, w);
+      if (!base || base.circular) continue;
+      const d = fromRoot(w, own.pos, { ...base, word: roots[i] });
+      if (own.ipa) d.ipa = own.ipa;
+      return d;
     }
-    return wiktionaryDef(w);
+    if (own && own.mainCircular) { delete own.mainCircular; return own; }   // no root found: use the secondary sense
+    return own || wiktionaryDef(w);
   });
 
   // Returns { main, alts, dict } — dict is true when Google has a real dictionary entry for it.
