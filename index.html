@@ -546,7 +546,10 @@
         notice('Speech recognition needs an internet connection. Retrying…');
         restartDelay = Math.min(restartDelay * 2, 5000);
       } else if (e.error === 'audio-capture') {
-        notice('No microphone was found.');
+        notice('The microphone couldn’t be opened — another app may be using it.');
+        restartDelay = Math.min(restartDelay * 2, 5000);
+      } else if (e.error !== 'no-speech' && e.error !== 'aborted') {
+        notice('Listening problem: <b>' + esc(e.error) + '</b>. Retrying…');
         restartDelay = Math.min(restartDelay * 2, 5000);
       }
     };
@@ -604,7 +607,7 @@
     } catch {}
   }
 
-  function startSession() {
+  async function startSession() {
     if (!SR) {
       notice('This browser can’t listen for words. Use <b>Chrome on Android</b> or <b>Safari on iPhone</b>. You can still type words below.');
       return;
@@ -614,9 +617,25 @@
       return;
     }
     notice('');
-    listening = true;
     // Unlock speech output inside the tap (required on iOS).
     if (canSpeak && prefs.def) { const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); }
+    // Ask for the mic up front so the browser shows its prompt and we get a clear error if it's blocked.
+    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+      setStatus('looking');
+      $('#statusText').textContent = 'Asking for the microphone…';
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+      } catch (err) {
+        setStatus();
+        notice(err && err.name === 'NotFoundError'
+          ? 'No microphone was found on this device.'
+          : 'The microphone is blocked for this site. Tap the icon to the left of the address bar → <b>Permissions</b> (or <b>Site settings</b>) → <b>Microphone</b> → <b>Allow</b>. ' +
+            'Also check your phone’s <b>Settings → Apps → Chrome → Permissions → Microphone</b>. Then tap <b>Start reading</b> again.');
+        return;
+      }
+    }
+    listening = true;
     rec = rec || makeRec();
     startRec();
     requestWake();
