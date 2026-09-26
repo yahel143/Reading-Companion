@@ -96,6 +96,13 @@
 
   .notice { background: var(--accent-soft); border-radius: 12px; padding: 12px 14px; font-size: 14px; line-height: 1.45; margin-top: 14px; }
   .notice:empty { display: none; }
+  .notice .steps { margin: 8px 0 4px; padding-left: 22px; }
+  .notice .steps li { margin: 5px 0; }
+  .notice .small { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+  .notice .reload {
+    margin-top: 10px; width: 100%; padding: 11px; border: 0; border-radius: 10px;
+    background: var(--accent); color: #fff; font: 600 15px var(--sans); cursor: pointer;
+  }
 
   /* Result card */
   #card {
@@ -261,7 +268,7 @@
   function renderEmpty() {
     const card = $('#card');
     card.className = 'empty';
-    card.innerHTML = listening ? 'Say a word you don’t know.' : 'Choose what you want above,<br>then tap <b>Start reading</b>.';
+    card.innerHTML = listening ? '<p>Say a word you don’t know.</p>' : '<p>Choose what you want above,<br>then tap <b>Start reading</b>.</p>';
   }
 
   function renderLoading(word) {
@@ -541,7 +548,7 @@
     r.onerror = (e) => {
       if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
         stopSession();
-        notice('Microphone access is blocked. Allow the microphone for this page in your browser settings, then tap <b>Start reading</b> again.');
+        showMicHelp();
       } else if (e.error === 'network') {
         notice('Speech recognition needs an internet connection. Retrying…');
         restartDelay = Math.min(restartDelay * 2, 5000);
@@ -597,6 +604,63 @@
     lookupAndShow(w, alts);
   }
 
+  // ---------- Microphone help ----------
+  const isIOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  const isChromeIOS = /CriOS/i.test(navigator.userAgent);
+
+  // Step-by-step fix for a blocked mic, tailored to where the block is.
+  async function showMicHelp() {
+    let state = 'unknown';
+    try { state = (await navigator.permissions.query({ name: 'microphone' })).state; } catch {}
+    const host = location.host || 'this site';
+    const steps = (title, items) =>
+      `<b>${title}</b><ol class="steps">${items.map((s) => `<li>${s}</li>`).join('')}</ol>`;
+    let html;
+    if (isIOS) {
+      html = isChromeIOS
+        ? steps('Let Chrome use the microphone', [
+            'Open the iPhone <b>Settings</b> app.',
+            'Scroll down and tap <b>Chrome</b>.',
+            'Turn <b>Microphone</b> on.',
+            'Come back here and tap <b>Reload</b> below.',
+          ])
+        : steps('Let this site use the microphone', [
+            'Tap <b>aA</b> (or the page icon) in Safari’s address bar.',
+            'Tap <b>Website Settings</b>.',
+            'Set <b>Microphone</b> to <b>Allow</b>.',
+            'Tap <b>Reload</b> below.',
+          ]);
+    } else if (state === 'denied') {
+      // Chrome itself remembers "Block" for this site.
+      html = steps(`Chrome is blocking the microphone for ${esc(host)}`, [
+        'Tap Chrome’s <b>⋮</b> menu (top right) → <b>Settings</b>.',
+        'Tap <b>Site settings</b> → <b>Microphone</b>.',
+        `Under <b>Blocked</b>, tap <b>${esc(host)}</b> and choose <b>Allow</b>.`,
+        'Come back here and tap <b>Reload</b> below.',
+      ]) + '<p class="small">Still blocked? Also check the phone step below.</p>' + phoneStep();
+    } else {
+      // The site isn't blocked in Chrome, so the phone is stopping Chrome from using the mic
+      // (or the prompt was dismissed).
+      html = steps('Your phone isn’t letting Chrome use the microphone', [
+        'Open your phone’s <b>Settings</b> app → <b>Apps</b> → <b>Chrome</b>.',
+        'Tap <b>Permissions</b> → <b>Microphone</b>.',
+        'Choose <b>Allow only while using the app</b>.',
+        'Come back here and tap <b>Reload</b> below — Chrome will then ask you, tap <b>Allow</b>.',
+      ]);
+    }
+    notice(html + '<button type="button" class="reload" onclick="location.reload()">Reload</button>');
+  }
+  function phoneStep() {
+    return '<p class="small">Phone Settings → Apps → Chrome → Permissions → Microphone → <b>Allow only while using the app</b>.</p>';
+  }
+
+  // If the permission gets fixed while the page is open, clear the help right away.
+  try {
+    navigator.permissions.query({ name: 'microphone' }).then((p) => {
+      p.onchange = () => { if (p.state === 'granted') notice('Microphone allowed — tap <b>Start reading</b>.'); };
+    }).catch(() => {});
+  } catch {}
+
   // ---------- Session ----------
   async function requestWake() {
     try {
@@ -628,10 +692,8 @@
         stream.getTracks().forEach((t) => t.stop());
       } catch (err) {
         setStatus();
-        notice(err && err.name === 'NotFoundError'
-          ? 'No microphone was found on this device.'
-          : 'The microphone is blocked for this site. Tap the icon to the left of the address bar → <b>Permissions</b> (or <b>Site settings</b>) → <b>Microphone</b> → <b>Allow</b>. ' +
-            'Also check your phone’s <b>Settings → Apps → Chrome → Permissions → Microphone</b>. Then tap <b>Start reading</b> again.');
+        if (err && err.name === 'NotFoundError') notice('No microphone was found on this device.');
+        else await showMicHelp();
         return;
       }
     }
