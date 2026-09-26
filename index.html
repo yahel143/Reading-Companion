@@ -88,6 +88,11 @@
   .field span { display: flex; justify-content: space-between; margin-bottom: 6px; color: var(--muted); }
   .field select { width: 100%; padding: 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); font: 15px var(--sans); }
   .field input[type=range] { width: 100%; accent-color: var(--accent); }
+  .ai-status { font-size: 13.5px; line-height: 1.45; margin: -4px 0 12px; }
+  .ai-status .muted { color: var(--muted); }
+  .ai-status .bar { display: block; height: 4px; border-radius: 2px; background: var(--line); margin-top: 6px; overflow: hidden; }
+  .ai-status .bar i { display: block; height: 100%; background: var(--accent); transition: width .2s; }
+  .linkbtn { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; text-decoration: underline; cursor: pointer; }
   .voice .small { font-size: 12.5px; color: var(--muted); line-height: 1.45; margin: 12px 0 0; }
 
   /* Start / stop */
@@ -186,6 +191,14 @@
 
   <details class="voice" id="voiceBox">
     <summary>Voice</summary>
+    <label class="field">
+      <span>Voice type</span>
+      <select id="engineSel">
+        <option value="ai">Natural AI voice (Kristin)</option>
+        <option value="phone">Phone’s built-in voice (fastest)</option>
+      </select>
+    </label>
+    <p class="ai-status" id="aiStatus"></p>
     <label class="field">
       <span>Speaker</span>
       <select id="voiceSel"></select>
@@ -556,6 +569,10 @@
     pickVoice();
     speechSynthesis.onvoiceschanged = pickVoice;
     $('#voiceSel').addEventListener('change', (e) => { prefs.voice = e.target.value; save('margin.prefs', prefs); pickVoice(); preview(); });
+  } else {
+    $('#voiceSel').closest('.field').style.display = 'none';
+  }
+  {
     const rate = $('#rateSel');
     rate.value = prefs.rate || 0.95;
     const showRate = () => ($('#rateVal').textContent = (+rate.value).toFixed(2).replace(/0$/, '') + '×');
@@ -563,8 +580,6 @@
     rate.addEventListener('input', showRate);
     rate.addEventListener('change', () => { prefs.rate = +rate.value; save('margin.prefs', prefs); preview(); });
     $('#voicePreview').addEventListener('click', preview);
-  } else {
-    $('#voiceBox').style.display = 'none';
   }
   function preview() { say('Ephemeral: lasting for a very short time.'); }
 
@@ -574,28 +589,254 @@
     say(`${r.word}: ${r.def.text}`);
   }
 
-  function say(text) {
-    if (!canSpeak) return;
+  // ---------- Natural AI voice (Piper "Kristin", runs on the phone) ----------
+  // Files live next to this page in tts/. The voice model was compressed to 8-bit (63 → 18.7 MB) and the
+  // pronunciation data trimmed to English only (18 → 1 MB). Everything is cached after the first download.
+  const TTS_BASE = new URL('tts/', location.href).href;
+  const ORT_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/onnxruntime-web/1.18.0/';
+  const TTS_CACHE = 'margin-tts-v1';
+  const AI_TIMEOUT_MS = 1500;   // slower than this → use the phone voice for that sentence
+  const AI = { state: 'idle', loaded: 0, total: 0, session: null, cfg: null, createPhonemizer: null, phonData: null, phonWasm: null, spare: null, error: '' };
+  const aiAudio = new Map();    // text → Float32Array, so repeats play instantly
+  let audioCtx = null, audioSrc = null, sayId = 0;
+
+  function aiWanted() { return prefs.engine !== 'phone'; }
+  function aiReady() { return aiWanted() && AI.state === 'ready'; }
+
+  // Browsers only allow sound after a tap, so create/resume the audio context on the first touch.
+  function unlockAudio() {
+    try {
+      audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+      if (audioCtx.state === 'suspended') audioCtx.resume();
+    } catch {}
+  }
+  document.addEventListener('pointerdown', unlockAudio, true);
+
+  async function fetchCached(url, onBytes) {
+    let cache = null;
+    try { cache = await caches.open(TTS_CACHE); const hit = await cache.match(url); if (hit) { const b = await hit.arrayBuffer(); onBytes(b.byteLength); return b; } } catch {}
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('HTTP ' + res.status + ' for ' + url.split('/').pop());
+    const reader = res.body.getReader(), parts = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value); got += value.length; onBytes(value.length);
+    }
+    const buf = new Uint8Array(got);
+    let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
+    try { if (cache) await cache.put(url, new Response(buf)); } catch {}
+    return buf.buffer;
+  }
+
+  // Talk to tts/worker.js. Jobs run one at a time; stale jobs (for speech that was cancelled) are skipped.
+  let rpcId = 0, rpcQueue = Promise.resolve();
+  const rpcWaiting = new Map();
+  function rpc(msg, transfer) {
+    return new Promise((ok, fail) => {
+      const id = ++rpcId;
+      rpcWaiting.set(id, { ok, fail });
+      AI.worker.postMessage({ ...msg, id }, transfer || []);
+    });
+  }
+  function startWorker() {
+    AI.worker = new Worker(TTS_BASE + 'worker.js');
+    AI.worker.onmessage = (e) => {
+      const w = rpcWaiting.get(e.data.id);
+      if (!w) return;
+      rpcWaiting.delete(e.data.id);
+      e.data.ok ? w.ok(e.data) : w.fail(new Error(e.data.error));
+    };
+    AI.worker.onerror = (e) => {
+      for (const w of rpcWaiting.values()) w.fail(new Error(e.message || 'voice worker failed'));
+      rpcWaiting.clear();
+    };
+  }
+
+  async function loadAI() {
+    if (AI.state === 'loading' || AI.state === 'ready') return;
+    AI.state = 'loading'; AI.loaded = 0; AI.error = '';
+    // Uncompressed byte sizes, for the progress bar.
+    const files = { model: 18665992, data: 986700, wasm: 635212, cfg: 4968, ort: 10595041 };
+    AI.total = Object.values(files).reduce((a, b) => a + b, 0);
+    const tick = (n) => { AI.loaded = Math.min(AI.total, AI.loaded + n); renderAI(); };
+    renderAI();
+    try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {}
+    try {
+      const [model, data, wasm, cfg] = await Promise.all([
+        fetchCached(TTS_BASE + 'kristin-int8.onnx', tick),
+        fetchCached(TTS_BASE + 'espeak-en.data', tick),
+        fetchCached(TTS_BASE + 'phonemize.wasm', tick),
+        fetchCached(TTS_BASE + 'kristin.onnx.json', tick),
+        // Warm the browser cache with the inference engine so it loads instantly below.
+        fetch(ORT_BASE + 'ort-wasm-simd.wasm').then((r) => r.arrayBuffer()).then((b) => tick(b.byteLength)).catch(() => {}),
+      ]);
+      AI.cfg = JSON.parse(new TextDecoder().decode(cfg));
+      AI.phonData = data; AI.phonWasm = wasm;
+      AI.createPhonemizer = (await import(TTS_BASE + 'phonemize.js')).createPiperPhonemize;
+      startWorker();
+      await rpc({ type: 'init', model }, [model]);
+      AI.spare = newPhonemizer();
+      await synthAI('Hi.');           // first run is slow; do it now instead of on the first word
+      unlockAudio();                  // starting the audio system takes ~1 s the first time, so do it now too
+      AI.state = 'ready';
+    } catch (e) {
+      AI.state = 'error'; AI.error = (e && e.message) || String(e);
+    }
+    renderAI();
+  }
+
+  // The phonemizer program runs once per call, so keep a fresh instance ready in advance.
+  function newPhonemizer() {
+    const out = { ids: null };
+    out.ready = AI.createPhonemizer({
+      print: (line) => { try { out.ids = JSON.parse(line).phoneme_ids; } catch {} },
+      printErr: () => {},
+      wasmBinary: AI.phonWasm,
+      getPreloadedPackage: () => AI.phonData,
+      locateFile: (f) => TTS_BASE + (f.endsWith('.wasm') ? 'phonemize.wasm' : 'espeak-en.data'),
+    }).then((m) => { out.module = m; return out; });
+    return out;
+  }
+
+  async function phonemes(text) {
+    const inst = await (AI.spare || newPhonemizer()).ready;
+    AI.spare = newPhonemizer();
+    inst.module.callMain(['-l', AI.cfg.espeak.voice, '--input', JSON.stringify([{ text }]), '--espeak_data', '/espeak-ng-data']);
+    if (!inst.ids) throw new Error('No phonemes');
+    return inst.ids;
+  }
+
+  function synthAI(text, stale = () => false) {
+    const key = text + '|' + (prefs.rate || 0.95);
+    if (aiAudio.has(key)) return Promise.resolve(aiAudio.get(key));
+    const job = rpcQueue.then(async () => {
+      if (stale()) throw new Error('cancelled');
+      const ids = await phonemes(text);
+      const inf = AI.cfg.inference;
+      const { pcm } = await rpc({ type: 'run', ids, scales: [inf.noise_scale, inf.length_scale / (prefs.rate || 0.95), inf.noise_w] });
+      aiAudio.set(key, pcm);
+      if (aiAudio.size > 80) aiAudio.delete(aiAudio.keys().next().value);
+      return pcm;
+    });
+    rpcQueue = job.catch(() => {});
+    return job;
+  }
+
+  // Speak in pieces: the word first (quick to generate), then the definition phrase by phrase,
+  // so the voice starts almost at once and later pieces are generated while earlier ones play.
+  function speechPieces(text) {
+    const out = [];
+    let rest = text;
+    const m = text.match(/^([^:]{1,40}):\s*(.+)$/);
+    if (m) { out.push(m[1] + '.'); rest = m[2]; }
+    let cur = '';
+    for (const part of rest.split(/(?<=[,;:])\s+/)) {
+      cur = cur ? cur + ' ' + part : part;
+      // Keep the first phrase short so it's ready by the time the word finishes playing.
+      if (cur.length >= (out.length <= 1 ? 12 : 30)) { out.push(cur); cur = ''; }
+    }
+    if (cur) out.length > (m ? 1 : 0) && cur.length < 12 ? (out[out.length - 1] += ' ' + cur) : out.push(cur);
+    return out;
+  }
+
+  const playing = new Set();
+  // Schedule a piece right after the previous one (or now, if generation fell behind). Returns its end time.
+  function schedulePcm(pcm, at) {
+    unlockAudio();
+    const buf = audioCtx.createBuffer(1, pcm.length, AI.cfg.audio.sample_rate);
+    buf.copyToChannel(pcm, 0);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+    const start = Math.max(audioCtx.currentTime + 0.02, at);
+    src.start(start);
+    playing.add(src);
+    src.onended = () => playing.delete(src);
+    return start + buf.duration;
+  }
+
+  function stopAudio() {
+    for (const src of playing) { try { src.onended = null; src.stop(); } catch {} }
+    playing.clear();
+  }
+
+  function renderAI() {
+    const el = $('#aiStatus');
+    const mb = (b) => (b / 1e6).toFixed(0);
+    if (!aiWanted()) el.textContent = 'Using the phone’s built-in voice.';
+    else if (AI.state === 'loading') el.innerHTML = `Getting the natural voice… <b>${Math.round(100 * AI.loaded / (AI.total || 1))}%</b> <span class="muted">(${mb(AI.loaded)} of ${mb(AI.total)} MB, one time only)</span><span class="bar"><i style="width:${100 * AI.loaded / (AI.total || 1)}%"></i></span>`;
+    else if (AI.state === 'ready') el.innerHTML = '✓ Natural voice ready — works offline.';
+    else if (AI.state === 'error') el.innerHTML = `Couldn’t get the natural voice, using the phone voice. <button type="button" class="linkbtn" id="aiRetry">Try again</button>`;
+    else el.textContent = '';
+    const retry = $('#aiRetry');
+    if (retry) retry.onclick = () => { AI.state = 'idle'; loadAI(); };
+    $('#voiceSel').closest('.field').style.display = canSpeak && !aiWanted() ? '' : 'none';
+  }
+
+  $('#engineSel').value = aiWanted() ? 'ai' : 'phone';
+  $('#engineSel').addEventListener('change', (e) => {
+    prefs.engine = e.target.value; save('margin.prefs', prefs);
+    renderAI();
+    if (aiWanted()) loadAI();
+    preview();
+  });
+  if (aiWanted()) loadAI();
+  renderAI();
+  if (/[?&]debug\b/.test(location.search)) window.__margin = { AI, synthAI, phonemes, speechPieces, playing };
+
+  async function say(text) {
+    const my = ++sayId;
     // Pause the microphone so the phone doesn't hear itself.
     speaking = true;
     setStatus();
     if (rec && recActive) { try { rec.abort(); } catch {} }
-    speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
-    if (voice) u.voice = voice;
-    u.lang = voice ? voice.lang : 'en-US';
-    u.rate = prefs.rate || 0.95;
-    let done = false;
+    if (canSpeak) speechSynthesis.cancel();
+    stopAudio();
+    let done = false, fallback = null;
     const finish = () => {
-      if (done) return;
+      if (done || my !== sayId) return;
       done = true;
       clearTimeout(fallback);
       speaking = false;
       setStatus();
       if (listening) setTimeout(startRec, 200);
     };
+
+    if (aiReady()) {
+      const stale = () => my !== sayId;
+      const pieces = speechPieces(text);
+      // Queue every piece now; the worker generates them in order while earlier ones play.
+      const jobs = pieces.map((p) => synthAI(p, stale));
+      jobs.forEach((j) => j.catch(() => {}));
+      let first = null;
+      try {
+        first = await Promise.race([jobs[0], new Promise((_, fail) => setTimeout(() => fail(new Error('slow')), AI_TIMEOUT_MS))]);
+      } catch {}
+      if (stale()) return;
+      if (first) {
+        let end = schedulePcm(first, 0);
+        for (let i = 1; i < pieces.length; i++) {
+          let pcm;
+          try { pcm = await jobs[i]; } catch { break; }
+          if (stale()) return;
+          end = schedulePcm(pcm, end + (i === 1 ? 0.08 : 0.02));
+        }
+        if (stale()) return;
+        fallback = setTimeout(finish, Math.max(0, end - audioCtx.currentTime) * 1000 + 150);
+        return;
+      }
+      // Too slow or failed: fall through to the phone voice (the AI audio still gets cached for next time).
+    }
+
+    if (!canSpeak) { finish(); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    if (voice) u.voice = voice;
+    u.lang = voice ? voice.lang : 'en-US';
+    u.rate = prefs.rate || 0.95;
     // Some Android builds never fire onend — don't stay deaf forever.
-    const fallback = setTimeout(finish, 2500 + text.length * 85);
+    fallback = setTimeout(finish, 2500 + text.length * 85);
     u.onend = finish;
     u.onerror = finish;
     speechSynthesis.speak(u);
@@ -780,6 +1021,7 @@
     speaking = false;
     if (rec) { try { rec.abort(); } catch {} }
     if (canSpeak) speechSynthesis.cancel();
+    stopAudio();
     if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
     showLive('');
     setStatus();
